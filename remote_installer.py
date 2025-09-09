@@ -2,7 +2,9 @@ import argparse
 import ipaddress
 import os
 import subprocess
-import getpass # Usado para esconder a senha ao digitar
+import getpass
+from multiprocessing import Pool
+
 
 def parse_ips(ip_string):
     """Analisa uma string de IPs, que pode ser um range (ex: 192.168.1.1-192.168.1.10) ou uma lista separada por vírgulas."""
@@ -22,6 +24,7 @@ def parse_ips(ip_string):
         ips = [ip.strip() for ip in ip_string.split(',')]
     return ips
 
+
 def run_psexec_command(psexec_path, ip, username, password, command):
     """Executa um comando em uma máquina remota usando psexec.exe e retorna o resultado."""
     psexec_command = [
@@ -29,16 +32,20 @@ def run_psexec_command(psexec_path, ip, username, password, command):
         f"\\\\{ip}",
         "-u", username,
         "-p", password,
-        "-s", # Executa o comando com privilégios de sistema
-        "-accepteula", # Aceita o EULA do PsExec na primeira execução
+        "-s",
+        "-accepteula",
         "cmd.exe",
         "/c",
         command
     ]
-    
     try:
-        # O timeout é importante para evitar que o script fique preso em máquinas offline
-        result = subprocess.run(psexec_command, capture_output=True, text=True, encoding='latin-1', timeout=90)
+        result = subprocess.run(
+            psexec_command,
+            capture_output=True,
+            text=True,
+            encoding='latin-1',
+            timeout=90
+        )
         return result
     except FileNotFoundError:
         print(f"Erro: O executável do PsExec não foi encontrado em '{psexec_path}'. Verifique o caminho.")
@@ -50,94 +57,94 @@ def run_psexec_command(psexec_path, ip, username, password, command):
         print(f"Ocorreu um erro inesperado ao executar o PsExec: {e}")
         return None
 
+
+def process_ip(args_tuple):
+    """Função chamada pelos workers do Pool."""
+    ip, psexec_path, args, password, msi_filename, remote_temp_path, force = args_tuple
+
+    print(f"\n--- Processando {ip} ---")
+
+    # Testa ping
+    ping_command = ['ping', '-n', '1', '-w', '1000', ip]
+    ping_result = subprocess.run(ping_command, capture_output=True, text=True)
+    if ping_result.returncode != 0:
+        print(f"Erro: {ip} está offline ou inacessível (ping falhou). Pulando...")
+        return
+
+    # 1. Verificar se o Netskope Client já está rodando
+    if not force:
+        print(f"Verificando processo 'Netskope Client' em {ip}...")
+        result = run_psexec_command(psexec_path, ip, args.username, password, "TASKLIST")
+
+        if result is None:
+            return
+
+        if "stAgentUI.exe" in result.stdout or "stAgentSvc.exe" in result.stdout:
+            print(f"-> 'Netskope Client' JÁ ESTÁ em execução em {ip}. Instalação ignorada.")
+            return
+        else:
+            print(f"-> 'Netskope Client' NÃO está em execução. Prosseguindo com a instalação.")
+
+    # 2. Copiar MSI
+    print(f"Copiando {msi_filename} para \\\\{ip}\\C$")
+    copy_command = f'copy "{args.msi_file}" \\\\{ip}\\C$'
+    copy_result = subprocess.run(copy_command, shell=True, capture_output=True, text=True)
+
+    if copy_result.returncode != 0:
+        print(f"-> Falha ao copiar o arquivo para {ip}. Erro: {copy_result.stderr}")
+        return
+    print("-> Cópia concluída.")
+
+    # 3. Instalar
+    full_install_command = args.install_command.replace("installer.msi", msi_filename)
+    print(f"Executando comando de instalação: '{full_install_command}'...")
+
+    install_result = run_psexec_command(psexec_path, ip, args.username, password, full_install_command)
+
+    if install_result and install_result.returncode == 0:
+        print(f"-> Instalação concluída com sucesso em {ip}.")
+    elif install_result:
+        print(f"-> Instalação falhou em {ip} com código {install_result.returncode}.")
+        print(f"   STDOUT: {install_result.stdout.strip()}")
+        print(f"   STDERR: {install_result.stderr.strip()}")
+
+    # 4. Limpar instalador
+    print(f"Limpando o instalador em {remote_temp_path}...")
+    cleanup_command = f"del {remote_temp_path}"
+    run_psexec_command(psexec_path, ip, args.username, password, cleanup_command)
+    print("-> Limpeza concluída.")
+
+
 def main():
-    # Caminho literal para o PsExec
     psexec_path = r"C:\PROJETOS\PSTools\PSexec.exe"
 
     parser = argparse.ArgumentParser(
         description='Ferramenta de instalação remota de MSI usando PsExec.exe.',
-        formatter_class=argparse.RawTextHelpFormatter # Melhora a formatação da ajuda
+        formatter_class=argparse.RawTextHelpFormatter
     )
+    parser.add_argument('--msi_file', required=True)
+    parser.add_argument('--ips', required=True)
+    parser.add_argument('--username', required=True)
+    parser.add_argument('--password')
+    parser.add_argument('--install_command', required=True)
+    parser.add_argument('--force', action='store_true')
+    parser.add_argument('--processes', type=int, default=20, help='Número de processos paralelos (padrão: 20)')
     
-    parser.add_argument('--msi_file', required=True, help='Caminho local completo para o arquivo MSI.')
-    parser.add_argument('--ips', required=True, help='Range de IPs (ex: 192.168.1.1-192.168.1.10) ou IPs separados por vírgula.')
-    parser.add_argument('--username', required=True, help='Nome de usuário para acesso remoto (ex: dominio\\usuario).')
-    parser.add_argument('--password', help='Senha para acesso remoto. Se não for fornecida, será solicitada.')
-    parser.add_argument('--install_command', required=True, help='Comando de instalação do MSI (use "installer.msi" como placeholder).\nExemplo: "msiexec /i C:\\Windows\\Temp\\installer.msi /qn"')
-    parser.add_argument('--force', action='store_true', help='Força a reinstalação mesmo se o software já estiver instalado.')
     args = parser.parse_args()
 
-    # Solicita a senha de forma segura se não for passada como argumento
-    password = args.password if args.password else getpass.getpass(f"Digite a senha para o usuário {args.username}: ")
+    password = args.password if args.password else getpass.getpass(f"Digite a senha para {args.username}: ")
 
     msi_filename = os.path.basename(args.msi_file)
     remote_temp_path = f"C:\\{msi_filename}"
-
+    processes = args.processes
+    
     ip_list = parse_ips(args.ips)
 
-    # Força a reinstalação se a flag --force for usada
-    force = args.force
-    
-    for ip in ip_list:
-        print(f"\n--- Processando {ip} ---")
-        
-        # Faça um teste de ping
-        ping_command = ['ping', '-n', '1', '-w', '1000', ip]
-        ping_result = subprocess.run(ping_command, capture_output=True, text=True)
-        if ping_result.returncode != 0:
-            print(f"Erro: {ip} está offline ou inacessível (ping falhou). Pulando...")
-            continue
-        
-        # 1. Verificar se o processo "Netskope Client" está em execução
-        if not force:
-            print(f"Verificando processo 'Netskope Client' em {ip}...")
-            check_command = 'TASKLIST'
-            result = run_psexec_command(psexec_path, ip, args.username, password, check_command)
+    jobs = [(ip, psexec_path, args, password, msi_filename, remote_temp_path, args.force) for ip in ip_list]
 
-            if result is None:
-                # Erro já foi impresso pela função run_psexec_command
-                continue
-        
-            # O PsExec pode retornar código 1 se o processo não for encontrado, o que é esperado.
-            # Verificamos a saída de texto para ter certeza.
-            if "stAgentUI.exe" in result.stdout or "stAgentSvc.exe" in result.stdout:
-                print(f"-> 'Netskope Client' JÁ ESTÁ em execução em {ip}. Instalação ignorada.")
-                
-                continue
-            else:
-                print(f"-> 'Netskope Client' NÃO está em execução. Prosseguindo com a instalação.")
+    with Pool(processes=processes) as pool:
+        pool.map(process_ip, jobs)
 
-        # 2. Copiar o arquivo MSI para o diretório temporário remoto
-        # O PsExec pode copiar arquivos automaticamente se o caminho for local
-        print(f"Copiando {msi_filename} para \\\\{ip}\\C$")
-        copy_command = f'copy "{args.msi_file}" \\\\{ip}\\C$'
-        # Usamos subprocess.run localmente para a cópia, pois é mais simples
-        copy_result = subprocess.run(copy_command, shell=True, capture_output=True, text=True)
-        
-        if copy_result.returncode != 0:
-            print(f"-> Falha ao copiar o arquivo para {ip}. Erro: {copy_result.stderr}")
-            continue
-        print("-> Cópia concluída.")
-
-        # 3. Executar o comando de instalação
-        # Substitui o placeholder pelo nome real do arquivo MSI
-        full_install_command = args.install_command.replace("installer.msi", msi_filename)
-        print(f"Executando comando de instalação: '{full_install_command}'...")
-        
-        install_result = run_psexec_command(psexec_path, ip, args.username, password, full_install_command)
-
-        if install_result and install_result.returncode == 0:
-            print(f"-> Instalação concluída com sucesso em {ip}.")
-        elif install_result:
-            print(f"-> Instalação falhou em {ip} com código de saída {install_result.returncode}.")
-            print(f"   STDOUT: {install_result.stdout.strip()}")
-            print(f"   STDERR: {install_result.stderr.strip()}")
-        
-        # 4. (Opcional) Limpar o arquivo de instalação
-        print(f"Limpando o instalador em {remote_temp_path}...")
-        cleanup_command = f"del {remote_temp_path}"
-        run_psexec_command(psexec_path, ip, args.username, password, cleanup_command)
-        print("-> Limpeza concluída.")
 
 if __name__ == '__main__':
     main()
